@@ -29,6 +29,17 @@ pub static RE_PAIR_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-HJK
 static RE_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\p{L}[\p{L}' -]{0,23}$").unwrap());
 static RE_REALM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}][\p{L}\p{N}' ()-]{0,63}$").unwrap());
 
+/// A realm name with anything the server wouldn't take dropped (the game can use other punctuation),
+/// spaces tidied and cut to 64 characters. The realm is only shown, so a cleaned one is fine.
+fn clean_realm(raw: &str) -> String
+{
+    let kept: String = raw.chars().filter(|c| c.is_alphanumeric() || " '()-".contains(*c)).collect();
+    let tidy = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    let start = tidy.trim_start_matches(|c: char| !c.is_alphanumeric());
+
+    start.chars().take(64).collect()
+}
+
 /// A character GUID as the game writes them.
 pub fn valid_guid(text: &str) -> bool
 {
@@ -218,13 +229,39 @@ pub fn parse_outbox(file_text: &str) -> Result<Outbox>
         }
 
         let name = text(fields, "name").unwrap_or("");
-        let realm = text(fields, "realm").unwrap_or("");
+        let realm_text = clean_realm(text(fields, "realm").unwrap_or(""));
+        let realm = realm_text.as_str();
         let saved = int(fields, "saved").unwrap_or(0);
         let proto = int(fields, "proto").unwrap_or(0);
-
-        if !RE_NAME.is_match(name) || !RE_REALM.is_match(realm) || !valid_time(saved) || !(1..=10_000).contains(&proto)
+        let problem = if !RE_NAME.is_match(name)
         {
-            out.skipped.push(format!("{guid}: bad name, realm, time or protocol"));
+            "bad character name"
+        }
+
+        // Some game versions report no realm at all (WoW Forever since Nov 2026); that's fine, the sync picks one.
+        else if !realm.is_empty() && !RE_REALM.is_match(realm)
+        {
+            "bad realm name"
+        }
+
+        else if !valid_time(saved)
+        {
+            "bad save time"
+        }
+
+        else if !(1..=10_000).contains(&proto)
+        {
+            "unknown protocol"
+        }
+
+        else
+        {
+            ""
+        };
+
+        if !problem.is_empty()
+        {
+            out.skipped.push(format!("{guid}: {problem}"));
             continue;
         }
 
@@ -793,6 +830,26 @@ mod tests
         assert!(!character.partners.iter().any(|p| p.guid == "not-a-guid"));
         assert_eq!(character.applied.get(BRAN), Some(&48213));
         assert!(outbox.skipped.len() >= 3);
+    }
+
+    #[test]
+    fn odd_realm_names_are_cleaned_and_bad_entries_say_why()
+    {
+        assert_eq!(clean_realm("CAMWOW US2 Realm 2 PvP"), "CAMWOW US2 Realm 2 PvP");
+        assert_eq!(clean_realm("[Forever] Doom:howl  (PvP)."), "Forever Doomhowl (PvP)");
+        assert_eq!(clean_realm("::"), "");
+        assert!(parse_outbox(&format!("SterlingQuestSyncOut = {{ [\"format\"] = 1, [\"characters\"] = {{ [\"{ME}\"] = {{ [\"name\"] = \"Kaelith Emberfall\", [\"realm\"] = \"\", [\"saved\"] = 1794770000, [\"proto\"] = 6 }} }} }}")).unwrap().skipped.is_empty(), "an empty realm is allowed");
+
+        let text = format!
+        (
+            "SterlingQuestSyncOut = {{ [\"format\"] = 1, [\"characters\"] = {{ [\"{ME}\"] = {{ [\"name\"] = \"Kaelith Emberfall\", [\"realm\"] = \"Doom.howl: Forever\", [\"saved\"] = 1794770000, [\"proto\"] = 6 }}, [\"{BRAN}\"] = {{ [\"name\"] = \"Bran\", [\"realm\"] = \"R\", [\"saved\"] = 5, [\"proto\"] = 6 }} }} }}"
+        );
+
+        let outbox = parse_outbox(&text).unwrap();
+
+        assert_eq!(outbox.characters.len(), 1);
+        assert_eq!(outbox.characters[0].realm, "Doomhowl Forever");
+        assert_eq!(outbox.skipped, vec![format!("{BRAN}: bad save time")]);
     }
 
     #[test]

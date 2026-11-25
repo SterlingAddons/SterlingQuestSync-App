@@ -565,6 +565,9 @@ pub fn set_favorite(fs_: &SafeFs, state: &mut State, me: &str, partner: &str, on
     Ok(true)
 }
 
+/// Shown for a character whose game reported no realm and who isn't on the server yet.
+pub const UNKNOWN_REALM: &str = "Unknown realm";
+
 /// One full pass. `now` is the wall clock, used only for `written` and `last_sync`.
 /// `app` carries the versions the add-on shows; None leaves what the inbox has.
 pub fn sync(api: &dyn Api, fs_: &SafeFs, state: &mut State, outboxes: &[Outbox], app: Option<AppInfo>, now: i64) -> Result<Report>
@@ -583,7 +586,19 @@ pub fn sync(api: &dyn Api, fs_: &SafeFs, state: &mut State, outboxes: &[Outbox],
     // 1. Make sure every character in the outbox is listed, with its current name.
     for character_out in outboxes.iter().flat_map(|o| &o.characters)
     {
-        let listed = Character { guid: character_out.guid.clone(), name: character_out.name.clone(), realm: character_out.realm.clone() };
+        // No realm from the game: keep the one the server already has, or a stand-in the server accepts.
+        let realm = match character_out.realm.as_str()
+        {
+            "" => next
+                .listed
+                .get(&character_out.guid)
+                .map(|known| known.realm.clone())
+                .filter(|known| !known.is_empty())
+                .unwrap_or_else(|| UNKNOWN_REALM.to_string()),
+            given => given.to_string(),
+        };
+
+        let listed = Character { guid: character_out.guid.clone(), name: character_out.name.clone(), realm };
 
         if next.listed.get(&character_out.guid) != Some(&listed)
         {
@@ -1054,6 +1069,26 @@ mod tests
 
         companion::install(&safe, &[("SterlingQuestSync.toc", crate::formats::companion_toc().as_bytes())]).unwrap();
         (temp, safe)
+    }
+
+    #[test]
+    fn no_realm_from_the_game_keeps_the_known_one()
+    {
+        let (_t, fs_) = setup();
+        let api = Fake::default();
+        let mut state = load_state(&fs_);
+        let mut blank = outbox(1_794_770_000, "COPY1", None);
+
+        blank.characters[0].realm = String::new();
+        sync(&api, &fs_, &mut state, std::slice::from_ref(&blank), None, 1_794_770_100).unwrap();
+
+        assert_eq!(state.listed[ME].realm, UNKNOWN_REALM, "new character: a stand-in");
+
+        state.listed.get_mut(ME).unwrap().realm = "CAMWOW US2 Realm 2 PvP".into();
+        sync(&api, &fs_, &mut state, std::slice::from_ref(&blank), None, 1_794_770_200).unwrap();
+
+        assert_eq!(state.listed[ME].realm, "CAMWOW US2 Realm 2 PvP", "known character keeps its realm");
+        assert_eq!(*api.chars.borrow(), 1, "nothing changed, so nothing sent again");
     }
 
     #[test]

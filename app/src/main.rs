@@ -36,6 +36,8 @@ const VERSION: &str = env!("SQS_DISPLAY_VERSION");
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ACTIVITY: usize = 200;
 const STERLING_CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// Syncs also look for a new app version, at most this often, so a fix shows on Home within the hour.
+const APP_CHECK_AT_SYNC: Duration = Duration::from_secs(3600);
 const MAX_OUTBOX_BYTES: u64 = 16 * 1024 * 1024;
 
 // Companion add-on files, bundled at build time. Inbox.lua is never bundled.
@@ -212,6 +214,10 @@ struct Inner
     notices: Vec<notices::Notice>,
     /// Why the last app update failed, until the next try. Home then offers a manual download.
     update_failed: Option<String>,
+    /// What the last sync skipped and why, with character ids swapped for names. Logged again only when it changes.
+    last_skipped: Vec<String>,
+    /// When a sync last looked for a new app version.
+    app_checked_at_sync: Option<Instant>,
 }
 
 #[derive(Serialize, Clone)]
@@ -821,6 +827,47 @@ fn save_recovery_txt(app: AppHandle, state: State<'_, AppState>, code: String) -
 
 // ------------------------------------------------------------------ sync
 
+/// Text with every character id ("Player-1234-0ABC1234") swapped for that character's name.
+fn swap_guids(text: &str, name: &dyn Fn(&String) -> String) -> String
+{
+    let mut out = String::new();
+    let mut rest = text;
+
+    while let Some(at) = rest.find("Player-")
+    {
+        out.push_str(&rest[..at]);
+
+        let tail = &rest[at..];
+        let end = tail.char_indices().find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-')).map(|(i, _)| i).unwrap_or(tail.len());
+        let guid = tail[..end].to_string();
+
+        out.push_str(&if sqs_core::formats::valid_guid(&guid) { name(&guid) } else { guid });
+        rest = &tail[end..];
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// The skip reasons as people can read them: character ids become names, repeats are counted.
+fn skip_reasons(skipped: &[String], name: &dyn Fn(&String) -> String) -> Vec<String>
+{
+    let mut counted: Vec<(String, usize)> = Vec::new();
+
+    for reason in skipped
+    {
+        let readable = swap_guids(reason, name);
+
+        match counted.iter_mut().find(|(text, _)| *text == readable)
+        {
+            Some((_, count)) => *count += 1,
+            None => counted.push((readable, 1)),
+        }
+    }
+
+    counted.into_iter().map(|(text, count)| if count > 1 { format!("{text} (x{count})") } else { text }).collect()
+}
+
 /// Turns a sync report into the activity lines the window shows.
 fn describe(inner: &mut Inner, report: &Report)
 {
@@ -870,10 +917,14 @@ fn describe(inner: &mut Inner, report: &Report)
         inner.log(format!("Stopped syncing with {} (removed in game)", if who.is_empty() { "a partner".into() } else { who }), "");
     }
 
-    if !report.skipped.is_empty()
+    let skipped = skip_reasons(&report.skipped, &name);
+
+    if !skipped.is_empty() && skipped != inner.last_skipped
     {
-        inner.log(format!("Skipped {} item(s) that didn't pass checks", report.skipped.len()), "bad");
+        inner.log(format!("Skipped {} item(s) that didn't pass checks: {}", report.skipped.len(), skipped.join("; ")), "bad");
     }
+
+    inner.last_skipped = skipped;
 
     if report.inbox_written && (!report.received_from.is_empty() || !report.ended.is_empty() || report.auto_offered > 0)
     {
@@ -903,8 +954,28 @@ fn run_sync(app: &AppHandle) -> Result<Report, String>
     };
 
     emit_status(app);
-    // Every sync also picks up the owner's notices (one small request), on top of the launch and 6-hour checks.
+    // Every sync also picks up the owner's notices (one small request), on top of the launch and 6-hour checks,
+    // and once an hour looks for a new app version, so a fix doesn't wait for the 6-hour check.
     check_notices(app);
+
+    let due =
+    {
+        let state = app.state::<AppState>();
+        let mut inner = state.inner.lock().unwrap();
+        let due = inner.app_checked_at_sync.is_none_or(|at| at.elapsed() >= APP_CHECK_AT_SYNC);
+
+        if due
+        {
+            inner.app_checked_at_sync = Some(Instant::now());
+        }
+
+        due
+    };
+
+    if due
+    {
+        let _ = check_app_update(app);
+    }
 
     let res = (||
     {
@@ -1814,6 +1885,16 @@ fn maybe_sync(app: &AppHandle) -> Result<(), String>
 /// Short notes shown once after an update, newest last. Keep each line plain and under ~80 characters.
 const WHATS_NEW: &[(&str, &[&str])] = &
 [
+    (
+        "0.1.30",
+        &
+        [
+            "Fixed: your saves were skipped after WoW Forever stopped reporting the realm name. /reload once to share your progress.",
+            "Activity now says why something was skipped at a sync, and Copy support details lists it too.",
+            "New app versions now show on Home within the hour instead of up to 6 hours.",
+        ],
+    ),
+
     ("0.1.29", &["Test builds of Sterling Quest Sync (like 0.3.17.01) now show as installed and keep updating."]),
     ("0.1.28", &["If Start with Windows is turned off in Task Manager or Windows Settings, the app leaves it off and says so in Settings."]),
     ("0.1.27", &["Installing a new version over a much older one works again, without uninstalling first."]),
@@ -2287,6 +2368,18 @@ fn support_details(state: State<'_, AppState>) -> String
         out.push_str(&format!("  {} {}\n", ago(Some(event.t)), clean(&event.text)));
     }
 
+    out.push_str("Skipped at the last sync:\n");
+
+    if inner.last_skipped.is_empty()
+    {
+        out.push_str("  nothing\n");
+    }
+
+    for reason in &inner.last_skipped
+    {
+        out.push_str(&format!("  {}\n", clean(reason)));
+    }
+
     out.push_str("Crash log (newest first):\n");
 
     let crash = fs::read_to_string(app_data().join("crash.log")).unwrap_or_default();
@@ -2600,6 +2693,8 @@ fn main()
             notices: Vec::new(),
             update_failed: None,
             managers: Vec::new(),
+            last_skipped: Vec::new(),
+            app_checked_at_sync: None,
         }),
 
         keys: Arc::new(SystemStore),
@@ -2770,6 +2865,21 @@ mod tests
     /// strands people on an old version (0.1.24's publisher change broke installing over 0.1.23, and
     /// the repo move broke 0.1.23's update check). If one really must change, the installer and the
     /// update feed need a plan first; see "Sterling Quest Sync - Updates, Notices and Deploys".
+    #[test]
+    fn skip_reasons_name_characters_and_count_repeats()
+    {
+        let name = |guid: &String| if guid == "Player-6800-0000A11C" { "Kaelith".to_string() } else { "a character".to_string() };
+        let skipped = vec!
+        [
+            "Player-6800-0000A11C: bad realm name".to_string(),
+            "Player-6800-0000A11C: bad realm name".into(),
+            "Player-1-0000BEEF: bad self copy".into(),
+            "outbox file too large".into(),
+        ];
+
+        assert_eq!(skip_reasons(&skipped, &name), vec!["Kaelith: bad realm name (x2)", "a character: bad self copy", "outbox file too large"]);
+    }
+
     #[test]
     fn startup_state_follows_windows()
     {

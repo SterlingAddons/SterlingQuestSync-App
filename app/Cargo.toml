@@ -1,6 +1,6 @@
 [package]
 name = "sterling-quest-sync"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2024"
 description = "Sterling Quest Sync desktop app"
 license = "MIT"
